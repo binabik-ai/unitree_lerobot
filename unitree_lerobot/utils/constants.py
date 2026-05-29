@@ -487,6 +487,37 @@ UNIARML1_CONFIG = RobotConfig(
     json_action_data_name=["arm.qpos", "gripper.qpos"],
 )
 
+G1_SERIAL_CONFIG = RobotConfig(
+    motors=[
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristYaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+        "kLeftGripper",
+        "kRightGripper",
+    ],
+    cameras=[
+        "cam_head",
+        "cam_left_wrist",
+    ],
+    camera_to_image_key={
+        "color_0": "cam_head",
+        "color_1": "cam_left_wrist",
+    },
+    json_state_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+    json_action_data_name=["left_arm.qpos", "right_arm.qpos", "left_ee.qpos", "right_ee.qpos"],
+)
+
 ROBOT_CONFIGS = {
     "Unitree_Z1_Single": Z1_SINGLE_CONFIG,
     "Unitree_Z1_Dual": Z1_CONFIG,
@@ -500,4 +531,5 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_NoUseWaist": LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_Arm_L1": UNIARML1_CONFIG,
+    "Unitree_G1_Serial_Cam2": G1_SERIAL_CONFIG,
 }
