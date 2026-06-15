@@ -17,9 +17,11 @@ from typing import Any
 
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.utils.utils import (
-    get_safe_torch_device,
     init_logging,
 )
+from lerobot.utils.device_utils import get_safe_torch_device
+from lerobot.utils.import_utils import register_third_party_plugins
+
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -39,6 +41,7 @@ from unitree_lerobot.eval_robot.utils.utils import (
     predict_action,
     to_list,
     to_scalar,
+    JointAdapter,
 )
 from unitree_lerobot.eval_robot.utils.sim_savedata_utils import (
     EvalRealConfig,
@@ -76,7 +79,7 @@ def eval_policy(
     image_info = None
     try:
         # --- Setup Phase ---
-        image_info = setup_image_client(cfg)
+        img_client, cam_cfg = setup_image_client(cfg)
         robot_interface = setup_robot_interface(cfg)
 
         # Unpack interfaces for convenience
@@ -86,6 +89,7 @@ def eval_policy(
             ee_shared_mem,
             arm_dof,
             ee_dof,
+            full_joint_names,
             sim_state_subscriber,
             sim_reward_subscriber,
             episode_writer,
@@ -98,28 +102,37 @@ def eval_policy(
                 "ee_shared_mem",
                 "arm_dof",
                 "ee_dof",
+                "full_joint_names",
                 "sim_state_subscriber",
                 "sim_reward_subscriber",
                 "episode_writer",
                 "reset_pose_publisher",
             ]
         )
-        tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam = (
-            image_info[key]
-            for key in [
-                "tv_img_array",
-                "wrist_img_array",
-                "tv_img_shape",
-                "wrist_img_shape",
-                "is_binocular",
-                "has_wrist_cam",
-            ]
-        )
 
-        # Get initial pose from the first step of the dataset
+        # The policy controls only the joints recorded in the dataset (e.g. a single arm +
+        # hand). Map between that subset and the robot's full command vector
+        # [dual_arm (arm_dof), left_ee (ee_dof), right_ee (ee_dof)] using joint names, so
+        # uncontrolled joints are held at a fixed pose instead of needing recorded actions.
+        policy_joint_names = dataset.meta.features["action"]["names"]
+        adapter = JointAdapter(policy_joint_names, full_joint_names, arm_dof + 2 * ee_dof)
+
+        def read_full_state():
+            """Assemble the robot's full measured state in canonical command order."""
+            arm_q = arm_ctrl.get_current_dual_arm_q()
+            if cfg.ee:
+                with ee_shared_mem["lock"]:
+                    ee_q = np.array(ee_shared_mem["state"][:])
+            else:
+                ee_q = np.zeros(0)
+            return np.concatenate([arm_q, ee_q])
+
+
+        # Get the policy's recorded starting pose from the first step of the dataset.
         from_idx = dataset.meta.episodes["dataset_from_index"][0]
         step = dataset[from_idx]
-        init_arm_pose = step["observation.state"][:arm_dof].cpu().numpy()
+        init_policy_state = step["observation.state"].cpu().numpy()
+        init_arm_pose = None
 
         user_input = input("Enter 's' to initialize the robot and start the evaluation: ")
         idx = 0
@@ -132,10 +145,16 @@ def eval_policy(
         }
 
         if user_input.lower() == "s":
-            # "The initial positions of the robot's arm and fingers take the initial positions during data recording."
+            # Freeze the joints the policy does NOT control at wherever the robot currently
+            # is (the operator-chosen rest pose); the policy never produces actions for them.
+            adapter.set_defaults(read_full_state())
+            # "The initial positions of the robot's arm and fingers take the initial positions
+            # during data recording." Move the controlled joints to the recorded start pose
+            # while holding the rest at their default.
             logger_mp.info("Initializing robot to starting pose...")
-            tau = robot_interface["arm_ik"].solve_tau(init_arm_pose)
-            robot_interface["arm_ctrl"].ctrl_dual_arm(init_arm_pose, tau)
+            init_arm_pose = adapter.to_robot(init_policy_state)[:arm_dof]
+            tau = arm_ik.solve_tau(init_arm_pose)
+            arm_ctrl.ctrl_dual_arm(init_arm_pose, tau)
             time.sleep(1.0)  # Give time for the robot to move
 
             # --- Run Main Loop ---
@@ -148,17 +167,16 @@ def eval_policy(
 
                 # 1. Get Observations
                 observation, current_arm_q = process_images_and_observations(
-                    tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam, arm_ctrl
-                )
-                left_ee_state = right_ee_state = np.array([])
+                    img_client, cam_cfg, arm_ctrl)
+
                 if cfg.ee:
                     with ee_shared_mem["lock"]:
                         full_state = np.array(ee_shared_mem["state"][:])
-                        left_ee_state = full_state[:ee_dof]
-                        right_ee_state = full_state[ee_dof:]
-                state_tensor = torch.from_numpy(
-                    np.concatenate((current_arm_q, left_ee_state, right_ee_state), axis=0)
-                ).float()
+                else:
+                    full_state = np.zeros(0)
+                # Gather only the joints the policy was trained on out of the full robot state.
+                full_robot_state = np.concatenate([current_arm_q, full_state])
+                state_tensor = torch.from_numpy(adapter.to_policy(full_robot_state)).float()
                 observation["observation.state"] = state_tensor
                 # 2. Get Action from Policy
                 action = predict_action(
@@ -174,15 +192,17 @@ def eval_policy(
                 )
                 action_np = action.cpu().numpy()
                 # 3. Execute Action
-                arm_action = action_np[:arm_dof]
+                # Scatter the policy action into a full command vector, holding every joint
+                # the policy does not control at its frozen default pose.
+                full_cmd = adapter.to_robot(action_np)
+
+                arm_action = full_cmd[:arm_dof]
                 tau = arm_ik.solve_tau(arm_action)
                 arm_ctrl.ctrl_dual_arm(arm_action, tau)
 
                 if cfg.ee:
-                    ee_action_start_idx = arm_dof
-                    left_ee_action = action_np[ee_action_start_idx : ee_action_start_idx + ee_dof]
-                    right_ee_action = action_np[ee_action_start_idx + ee_dof : ee_action_start_idx + 2 * ee_dof]
-                    # logger_mp.info(f"EE Action: left {left_ee_action}, right {right_ee_action}")
+                    left_ee_action = full_cmd[arm_dof : arm_dof + ee_dof]
+                    right_ee_action = full_cmd[arm_dof + ee_dof : arm_dof + 2 * ee_dof]
 
                     if isinstance(ee_shared_mem["left"], SynchronizedArray):
                         ee_shared_mem["left"][:] = to_list(left_ee_action)
@@ -192,7 +212,9 @@ def eval_policy(
                         ee_shared_mem["right"].value = to_scalar(right_ee_action)
                 # save data
                 if cfg.save_data:
-                    process_data_add(episode_writer, observation, current_arm_q, full_state, action, arm_dof, ee_dof)
+                    # Save the full-robot command so the recorded action matches the
+                    # full state dims (arm + both end-effectors), not just the policy subset.
+                    process_data_add(episode_writer, observation, current_arm_q, full_state, full_cmd, arm_dof, ee_dof)
 
                     is_success(
                         sim_reward_subscriber,
@@ -211,6 +233,8 @@ def eval_policy(
                 reward_stats["episode_num"] = reward_stats["episode_num"] + 1
                 # Maintain frequency
                 time.sleep(max(0, (1.0 / cfg.frequency) - (time.perf_counter() - loop_start_time)))
+
+                logger_mp.info(f"Action: {arm_action}")
 
     except Exception as e:
         logger_mp.info(f"An error occurred: {e}")
@@ -261,4 +285,7 @@ def eval_main(cfg: EvalRealConfig):
 
 if __name__ == "__main__":
     init_logging()
+    # Import installed `lerobot_policy_*` plugins so their config classes
+    # (e.g. dinoact, binabik_act) register with draccus before parsing.
+    register_third_party_plugins()
     eval_main()

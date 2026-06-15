@@ -191,6 +191,7 @@ class EvalRealConfig:
     task_dir: str = "./data"
     max_episodes: int = 1200
     rename_map: dict[str, str] = field(default_factory=dict)
+    image_host: str = '127.0.0.1'
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.

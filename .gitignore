@@ -10,3 +10,4 @@ cam_right_wrist.jpg
 cam_left_wrist.jpg
 data/
 ./data
+unitree_lerobot/cam_config_client.yaml

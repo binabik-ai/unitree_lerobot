@@ -17,6 +17,65 @@ logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
 
+class JointAdapter:
+    """Bridges a policy that controls only a subset of the robot's joints with the
+    robot's full command space.
+
+    The policy's action/observation space is whatever the training dataset recorded
+    (e.g. a single arm + hand). The robot, however, must always be commanded over its
+    full joint set. This adapter maps between the two using the joint *names* as the
+    single source of truth, so it generalizes to any subset without index arithmetic:
+
+      * ``to_policy`` gathers the controlled joints out of the full robot state, in the
+        exact order the policy expects.
+      * ``to_robot`` scatters a policy action back into a full command vector, leaving
+        every uncontrolled joint at its default (held) value.
+
+    The full command vector is assembled, in order, as
+    ``[dual_arm_q (arm_dof), left_ee (ee_dof), right_ee (ee_dof)]`` which matches the
+    canonical motor ordering in ``constants.ROBOT_CONFIGS``.
+
+    Defaults for the uncontrolled joints are not part of the dataset — they are seeded
+    from the live robot state via ``set_defaults`` (i.e. wherever the operator placed
+    the unused limb), then frozen there.
+    """
+
+    def __init__(self, policy_names: list[str], canonical_names: list[str], full_dim: int):
+        missing = [n for n in policy_names if n not in canonical_names]
+        if missing:
+            raise ValueError(
+                f"Policy joints {missing} are not in the robot's canonical joint layout. "
+                f"Available joints: {canonical_names}"
+            )
+        if len(canonical_names) != full_dim:
+            raise ValueError(
+                f"Canonical layout has {len(canonical_names)} joints but the robot command "
+                f"vector has {full_dim} dims; check the arm/end-effector configuration."
+            )
+        self.full_dim = full_dim
+        self.robot_idx = np.array([canonical_names.index(n) for n in policy_names], dtype=int)
+        self.default_full = np.zeros(full_dim, dtype=np.float64)
+
+    def set_defaults(self, full_state: np.ndarray) -> None:
+        """Seed the held pose for uncontrolled joints from the live robot state."""
+        full_state = np.asarray(full_state, dtype=np.float64)
+        if full_state.shape[0] != self.full_dim:
+            raise ValueError(
+                f"Expected full state of dim {self.full_dim}, got {full_state.shape[0]}."
+            )
+        self.default_full = full_state.copy()
+
+    def to_policy(self, full_state: np.ndarray) -> np.ndarray:
+        """Gather the controlled joints out of the full robot state."""
+        return np.asarray(full_state, dtype=np.float64)[self.robot_idx]
+
+    def to_robot(self, policy_action: np.ndarray) -> np.ndarray:
+        """Scatter a policy action into a full robot command, holding the rest."""
+        full = self.default_full.copy()
+        full[self.robot_idx] = np.asarray(policy_action, dtype=np.float64)
+        return full
+
+
 def extract_observation(step: dict):
     observation = {}
 
@@ -133,6 +192,14 @@ class EvalRealConfig:
     use_dataset: bool = False
 
     rename_map: dict[str, str] = field(default_factory=dict)
+
+    image_host: str = "192.168.123.164"
+
+    # Network interface (NIC) connected to the robot, e.g. "enx00e04c685878".
+    # Passed to ChannelFactoryInitialize(0, net_interface): the Unitree SDK builds
+    # its own inline CycloneDDS config and IGNORES CYCLONEDDS_URI, so the NIC must
+    # be pinned here or DDS auto-selects the wrong interface and never sees rt/lowstate.
+    net_interface: str = "enx00e04c685878"
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.

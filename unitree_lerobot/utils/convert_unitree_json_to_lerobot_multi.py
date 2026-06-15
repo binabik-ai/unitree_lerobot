@@ -453,6 +453,95 @@ def populate_dataset(
     return dataset
 
 
+def _read_available_bytes() -> int:
+    """Best-effort 'memory we may use right now' in bytes (0 if undeterminable).
+
+    Prefers ``MemAvailable`` from /proc/meminfo (the kernel's estimate of memory
+    obtainable without swapping), falling back to ``SC_AVPHYS_PAGES``.
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def _episode_frame_counts(episode_paths: list[str], n_color_cameras: int) -> list[int]:
+    """Frame count per episode, derived cheaply from the number of color images.
+
+    Counting files in each episode's ``colors/`` dir (and dividing by the number of
+    color cameras) avoids parsing every multi-MB ``data.json`` just to size memory.
+    """
+    counts = []
+    for p in episode_paths:
+        n_imgs = len(glob.glob(os.path.join(p, "colors", "*")))
+        counts.append(n_imgs // max(1, n_color_cameras))
+    return counts
+
+
+def _cap_workers_for_memory(
+    raw_dir: Path,
+    robot_type: str,
+    num_episodes: int,
+    requested_workers: int,
+    mem_safety_fraction: float,
+    overhead_factor: float,
+) -> int:
+    """Reduce ``requested_workers`` so the concurrent decoded-image buffers fit in RAM.
+
+    Each worker decodes an entire episode's images into memory at once (see
+    ``_parse_images``), so the peak is roughly ``sum over shards of (largest episode in
+    that shard) x bytes-per-frame x overhead_factor``. ``overhead_factor`` covers the
+    second live copy LeRobot's ``add_frame`` / async image writer holds. We pick the
+    largest worker count whose estimated peak stays under ``mem_safety_fraction`` of the
+    currently-available RAM. Returns the (possibly unchanged) worker count.
+    """
+    available = _read_available_bytes()
+    if available <= 0:
+        return requested_workers  # can't measure -> don't second-guess the user
+    budget = int(available * mem_safety_fraction)
+
+    counter = JsonDataset(raw_dir, robot_type, episode_indices=[], show_progress=False)
+    episode_paths = counter.episode_paths[:num_episodes]
+
+    # One decoded frame = sum over color cameras of H*W*C bytes (uint8 == 1 byte/elem).
+    shape_probe = JsonDataset(raw_dir, robot_type, episode_indices=[0], show_progress=False)
+    image_shapes = shape_probe.get_image_shapes(0)
+    bytes_per_frame = sum(h * w * c for (h, w, c) in image_shapes.values())
+
+    n_color_cameras = len(image_shapes)
+    frame_counts = _episode_frame_counts(episode_paths, n_color_cameras)
+    per_episode_peak = [fc * bytes_per_frame * overhead_factor for fc in frame_counts]
+
+    def total_peak(shards: list[list[int]]) -> float:
+        # All shards run concurrently; each holds its largest episode at a time.
+        return sum(max(per_episode_peak[i] for i in shard) for shard in shards)
+
+    k = max(1, requested_workers)
+    while k > 1 and total_peak(_split_indices(num_episodes, k)) > budget:
+        k -= 1
+
+    peak = total_peak(_split_indices(num_episodes, k))
+    if k < requested_workers:
+        print(
+            f"==> OOM guard: reducing --num_workers {requested_workers} -> {k} "
+            f"(est. peak ~{peak / 1e9:.1f} GB vs budget ~{budget / 1e9:.1f} GB "
+            f"of {available / 1e9:.1f} GB available)"
+        )
+    elif peak > budget:
+        print(
+            f"==> WARNING: estimated peak ~{peak / 1e9:.1f} GB exceeds budget "
+            f"~{budget / 1e9:.1f} GB even at {k} worker(s); proceeding but OOM is possible."
+        )
+    return k
+
+
 def _split_indices(num_episodes: int, num_shards: int) -> list[list[int]]:
     """Split ``range(num_episodes)`` into ``num_shards`` contiguous, near-equal chunks.
 
@@ -586,6 +675,8 @@ def json_to_lerobot(
     num_workers: int | None = 1,
     max_num_episodes: int | None = None,
     verbose: bool = False,
+    mem_safety_fraction: float = 0.7,
+    mem_overhead_factor: float = 2.5,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
     # Suppress lerobot's per-episode video-encoding / aggregation logging unless --verbose.
@@ -604,6 +695,17 @@ def json_to_lerobot(
 
     if num_workers is None:
         num_workers = os.cpu_count() or 1
+
+    # OOM guard: each worker decodes a whole episode's images into RAM at once, so the
+    # concurrent peak grows with num_workers. Cap workers to fit available memory.
+    # num_workers = _cap_workers_for_memory(
+    #     raw_dir,
+    #     robot_type,
+    #     num_episodes,
+    #     num_workers,
+    #     mem_safety_fraction=mem_safety_fraction,
+    #     overhead_factor=mem_overhead_factor,
+    # )
     shards = _split_indices(num_episodes, num_workers)
     num_shards = len(shards)
 

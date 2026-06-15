@@ -899,28 +899,28 @@ def main():
                 logger_mp.info(f"Head Camera FPS: {head_img.fps:.2f}")
                 logger_mp.debug(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
                 logger_mp.debug(f"Head Camera Binocular: {cam_config['head_camera']['binocular']}")
-                cv2.imshow("Head Camera", head_img.bgr)
+                # cv2.imshow("Head Camera", head_img.bgr)
 
         if cam_config['left_wrist_camera']['enable_zmq']:
             left_wrist_img = client.get_left_wrist_frame()
             if left_wrist_img.bgr is not None:
                 logger_mp.info(f"Left Wrist Camera FPS: {left_wrist_img.fps:.2f}")
                 logger_mp.debug(f"Left Wrist Camera Shape: {cam_config['left_wrist_camera']['image_shape']}")
-                cv2.imshow("Left Wrist Camera", left_wrist_img.bgr)
+                # cv2.imshow("Left Wrist Camera", left_wrist_img.bgr)
 
         if cam_config['right_wrist_camera']['enable_zmq']:
             right_wrist_img = client.get_right_wrist_frame()
             if right_wrist_img.bgr is not None:
                 logger_mp.info(f"Right Wrist Camera FPS: {right_wrist_img.fps:.2f}")
                 logger_mp.debug(f"Right Wrist Camera Shape: {cam_config['right_wrist_camera']['image_shape']}")
-                cv2.imshow("Right Wrist Camera", right_wrist_img.bgr)
+                # cv2.imshow("Right Wrist Camera", right_wrist_img.bgr)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            logger_mp.info("Exiting image client on user request.")
-            running = False
-            # clean up
-            client.close()
-            cv2.destroyAllWindows()
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     logger_mp.info("Exiting image client on user request.")
+        #     running = False
+        #     # clean up
+        #     client.close()
+        #     cv2.destroyAllWindows()
         # Small delay to prevent excessive CPU usage
         time.sleep(0.002)
 

@@ -23,8 +23,10 @@ from unitree_lerobot.eval_robot.robot_control.robot_hand_brainco import Brainco_
 from unitree_lerobot.eval_robot.robot_control.mobile_control import G1_Mobile_Lift_Controller
 
 
-from unitree_sdk2py.core.channel import ChannelPublisher
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+
+from unitree_lerobot.utils.constants import ROBOT_CONFIGS
 
 import logging_mp
 
@@ -70,6 +72,27 @@ EE_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+# Maps an end-effector key to the robot_type in `ROBOT_CONFIGS` whose canonical motor
+# ordering matches the assembled command vector [dual_arm, left_ee, right_ee]. Used to
+# derive the full joint-name layout the policy's joints get mapped into.
+EE_TO_ROBOT_TYPE = {
+    "dex3": "Unitree_G1_Dex3",
+    "dex1": "Unitree_G1_Dex1",
+    "inspire1": "Unitree_G1_Inspire",
+    "brainco": "Unitree_G1_Brainco",
+}
+
+
+def _full_joint_names(ee_key: str, arm_dof: int) -> list[str]:
+    """Canonical joint names of the full robot command vector, in command order.
+
+    With an end-effector this is the matching robot config's full motor list; without
+    one, just the arm joints (sliced from the canonical Dex3 layout)."""
+    if ee_key and ee_key in EE_TO_ROBOT_TYPE:
+        return list(ROBOT_CONFIGS[EE_TO_ROBOT_TYPE[ee_key]].motors)
+    return list(ROBOT_CONFIGS["Unitree_G1_Dex3"].motors[:arm_dof])
+
+
 def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
     """Initializes and starts the image client and shared memory."""
     # image client: img_config should be the same as the configuration in image_server.py (of Robot's development computing unit)
@@ -87,10 +110,24 @@ def setup_robot_interface(args: argparse.Namespace) -> dict[str, Any]:
     """
     Initializes robot controllers and IK solvers based on configuration.
     """
+    is_sim = getattr(args, "sim", False)
+
+    # Initialize DDS once, up front, pinned to the robot NIC. The Unitree SDK builds
+    # its own inline CycloneDDS config in ChannelFactoryInitialize and ignores
+    # CYCLONEDDS_URI; without an explicit interface it auto-selects the wrong NIC
+    # (when several are up) and rt/lowstate never arrives. ChannelFactory is a
+    # singleton, so the controllers' own ChannelFactoryInitialize calls below no-op.
+    net_interface = getattr(args, "net_interface", "")
+    if is_sim:
+        ChannelFactoryInitialize(1)
+    elif net_interface:
+        ChannelFactoryInitialize(0, net_interface)
+    else:
+        ChannelFactoryInitialize(0)
+
     # ---------- Arm ----------
     arm_spec = ARM_CONFIG[args.arm]
     arm_ik = arm_spec["ik_solver"]()
-    is_sim = getattr(args, "sim", False)
     arm_ctrl = arm_spec["controller"](motion_mode=args.motion, simulation_mode=is_sim)
 
     # ---------- End Effector (optional) ----------
@@ -121,6 +158,10 @@ def setup_robot_interface(args: argparse.Namespace) -> dict[str, Any]:
             "action": action_arr,
             "lock": data_lock,
         }
+
+    # Canonical joint-name layout of the full command vector [dual_arm, left_ee, right_ee],
+    # used to map a subset-controlling policy onto the robot's full joint set.
+    full_joint_names = _full_joint_names(getattr(args, "ee", "").lower(), int(arm_spec["dof"]))
 
     # ---------- Mobile Base / Lift (optional) ----------
     mobile_ctrl = None
@@ -156,6 +197,7 @@ def setup_robot_interface(args: argparse.Namespace) -> dict[str, Any]:
             "ee_shared_mem": ee_shared_mem,
             "arm_dof": int(arm_spec["dof"]),
             "ee_dof": ee_dof,
+            "full_joint_names": full_joint_names,
             "mobile_ctrl": mobile_ctrl,
             "mobile_action_dim": mobile_action_dim,
             "sim_state_subscriber": sim_state_subscriber,
@@ -170,6 +212,7 @@ def setup_robot_interface(args: argparse.Namespace) -> dict[str, Any]:
         "ee_shared_mem": ee_shared_mem,
         "arm_dof": int(arm_spec["dof"]),
         "ee_dof": ee_dof,
+        "full_joint_names": full_joint_names,
         "mobile_ctrl": mobile_ctrl,
         "mobile_action_dim": mobile_action_dim,
     }
@@ -186,13 +229,15 @@ def process_images_and_observations(img_client, camera_config, arm_ctrl):
         if camera_config['head_camera']['enable_zmq']:
             head_img = img_client.get_head_frame()
             if head_img is not None:
-                observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2])
-                observation["observation.images.cam_right_high"] = to_tensor_rgb(head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:])
+                # observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2])
+                # observation["observation.images.cam_right_high"] = to_tensor_rgb(head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:])
+                observation["observation.images.cam_head"] = to_tensor_rgb(head_img.bgr)
             else:
                 logger_mp.warning("Head image is None!")
 
         if camera_config['left_wrist_camera']['enable_zmq']:
             left_wrist = img_client.get_left_wrist_frame()
+            
             if left_wrist is not None:
                 observation["observation.images.cam_left_wrist"] = to_tensor_rgb(left_wrist.bgr)
             else:
